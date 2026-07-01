@@ -1,0 +1,10 @@
+{
+  "name": "privchat-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted PrivChat server - federates with privchat.net and other PrivChat servers.",
+  "scripts": {
+    "start": "npm --prefix backend start",
+    "dev": "npm --prefix backend run dev"
+  }
+}
