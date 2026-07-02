@@ -31,7 +31,9 @@ const username = z
   .regex(/^[A-Za-z0-9_.-]+$/, "Username can only use letters, numbers, dots, underscores, and dashes.");
 
 const csrfToken = z.string().min(32, "Secure session expired. Refresh and try again.").max(96);
-const hCaptchaResponse = z.string().min(1, "Please complete the captcha.").max(4096);
+// Captcha is optional on a self-hosted server (only verified when HCAPTCHA_*
+// is configured), so the token may be absent entirely.
+const hCaptchaResponse = z.string().max(4096).optional().default("");
 const profileAlias = z
   .string()
   .trim()

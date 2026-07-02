@@ -27,15 +27,30 @@ Full guide: https://privchat.net/docs (Self-hosting section)
 
 ## Install & run
 
+On a fresh Ubuntu/Debian VPS, install Node.js 22 first:
+
 ```bash
-git clone https://github.com/FreeMoneyHyb/federation-distro.git
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+```
+
+Then:
+
+```bash
+mkdir -p federation-distro
+curl -fsSL https://github.com/privchatdevs/privchat-selfhost/archive/refs/heads/main.tar.gz \
+  | tar -xz --strip-components=2 -C federation-distro privchat-selfhost-main/federation-distro
 cd federation-distro/backend
 npm ci
 npm start
 ```
 
-That's genuinely it. `npm ci` downloads the dependencies (the repo ships source
-only). Then first boot auto-configures the basics: it generates the secrets
+That's genuinely it. The `curl | tar` command downloads the self-host repo
+archive, extracts only `federation-distro`, and does it without Git installed,
+so there is no GitHub username/password prompt. `npm ci` downloads the
+dependencies (the repo ships source only). Then first boot auto-configures the basics: it generates the secrets
 (session, at-rest field key, channel-message encryption key), detects your
 VPS's public IP for `PUBLIC_URL`, and saves what it generated to
 `data/auto-config.json` so restarts reuse the same values. To customize
@@ -43,9 +58,54 @@ anything, `cp .env.example .env` and edit - whatever you set there always wins.
 The auto-detected IP works but is desktop-app-only and unencrypted; set
 `PUBLIC_URL` to a real HTTPS domain as soon as you have one.
 
-Or with Docker, from the repo root:
+## Turn on HTTPS (one step)
+
+Point your domain's DNS at the VPS (an A record, e.g. `chat.yourdomain.net ->
+your VPS IP`), open ports 80/443, then run this - Caddy gets and renews the
+SSL certificate automatically and proxies HTTPS to the app (WebSockets
+included):
 
 ```bash
+sudo apt-get install -y caddy
+printf 'chat.yourdomain.net {\n    reverse_proxy localhost:4000\n}\n' | sudo tee /etc/caddy/Caddyfile
+sudo systemctl restart caddy
+```
+
+Swap `chat.yourdomain.net` for your real domain (here and below), then tell
+the server its HTTPS address and restart it:
+
+```bash
+echo 'PUBLIC_URL=https://chat.yourdomain.net' >> .env
+npm start
+```
+
+Watch the boot log for `Self-check passed` - that confirms the domain,
+certificate, and proxy are wired correctly. Plain-http is LAN/testing only:
+browsers can't use it and traffic is unencrypted.
+
+### No domain? HTTPS on a raw IP
+
+With only an IP, Caddy can issue its own self-signed cert (`tls internal`) so
+traffic is still encrypted:
+
+```bash
+IP=203.0.113.10        # your VPS IP - the only line to change
+sudo apt-get install -y caddy
+printf "https://$IP {\n    tls internal\n    reverse_proxy localhost:4000\n}\n" | sudo tee /etc/caddy/Caddyfile
+sudo systemctl restart caddy
+echo "PUBLIC_URL=https://$IP" >> .env
+npm start
+```
+
+Set `IP` once at the top - the rest fills itself in. A self-signed cert isn't
+trusted by public CAs, so browsers show a "not private" warning you must click
+through - fine for the desktop app or personal testing, not for public
+sign-ups. A real domain is the only thing that "just works" for everyone.
+
+Or with Docker, from the downloaded repo root:
+
+```bash
+cd federation-distro
 docker build -t privchat-server .
 docker run -d --name privchat \
   -p 4000:4000 \
@@ -70,10 +130,16 @@ for the full annotated list). Required:
 | `AES_256_KEY_BASE64` | At-rest field encryption key (exactly 32 bytes, base64). |
 
 Optional: `DATA_DIR` (where everything lives - back it up), `S3_*`
-(S3-compatible media storage; without it media uploads are disabled but chat
-works), `SMTP_*` (verification emails; without it codes print to the console),
-`HCAPTCHA_*` (captcha on registration), `FEDERATION=off` (fully private
-standalone server).
+(S3-compatible storage for this server's OWN media - its icon/banner and files
+posted in its channels; members' profile avatars and banners come from their
+home server, you never store those. Without S3, media uploads are disabled but
+chat works), `HCAPTCHA_*` (captcha on registration), `FEDERATION=off` (fully
+private standalone server).
+
+**No email, on purpose.** A community server never sends email: registration
+is instant (no verification code), and email-dependent flows (password reset,
+email 2FA, email change) don't exist here. Keep your password in a password
+manager - there is no "forgot password" on a self-hosted server.
 
 ## Moderation
 

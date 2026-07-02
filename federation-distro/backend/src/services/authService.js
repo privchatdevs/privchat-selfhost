@@ -10,7 +10,9 @@ const assetService = require("./assetService");
 const { verifyHCaptcha } = require("../security/hcaptcha");
 const { getUserBadges, getAllUserBadges } = require("./badges");
 const { createSessionToken, hashSessionToken } = require("../security/sessionToken");
-const { sendVerificationEmail, sendAccountExistsEmail } = require("./emailService");
+// No email on a self-hosted community server: registration is instant (no
+// verification codes), and every email-dependent flow (login 2FA, password
+// reset, email change) is deliberately disabled below.
 const b2Storage = require("./b2Storage");
 const { generateInitialProfilePicture } = require("./profilePicture");
 const { normalizeOwnStatus } = require("./presence");
@@ -259,7 +261,10 @@ function sessionCookieOptions(expiresAt) {
   return {
     httpOnly: true,
     sameSite: "strict",
-    secure: config.isProduction,
+    // Follows the PUBLIC_URL scheme (see config.cookieSecure) - a Secure cookie
+    // over plain http is silently dropped by browsers, which would break login
+    // on an http self-host.
+    secure: config.cookieSecure,
     path: "/",
     expires: expiresAt,
   };
@@ -291,7 +296,7 @@ async function createSessionForUser({ user, rememberMe, ipAddress, userAgent }) 
   };
 }
 
-async function register({ username, email, password, publicKey, encryptedPrivateKey, keySalt, "h-captcha-response": hCaptchaResponse, ipAddress }) {
+async function register({ username, email, password, publicKey, encryptedPrivateKey, keySalt, "h-captcha-response": hCaptchaResponse, ipAddress, userAgent }) {
   await verifyHCaptcha({ token: hCaptchaResponse, ipAddress });
   cleanupExpiredPending();
 
@@ -317,19 +322,14 @@ async function register({ username, email, password, publicKey, encryptedPrivate
     error.statusCode = 409;
     throw error;
   }
-  // Enumeration-safe: if the email already has an account, respond EXACTLY like a
-  // fresh signup (same 202 "verification required" shape, no error) but create no
-  // pending registration and email the real owner a heads-up instead of a code. A
-  // prober can't tell a taken email from a free one from the response - the only
-  // way forward is inbox access. (Usernames are public, so a taken username still
-  // errors above.) hCaptcha above already makes bulk probing expensive.
+  // No email on a self-hosted server, so no enumeration-safe indirection is
+  // possible - a taken email simply errors. Fine for a single community.
   if (await userRepository.findByEmail(email)) {
-    sendAccountExistsEmail(email).catch(() => {});
-    return { verificationRequired: true, email };
+    const error = new Error("That email already has an account on this server.");
+    error.statusCode = 409;
+    throw error;
   }
 
-  // Hash now (so we never hold the plaintext password), but write NOTHING to the
-  // users table until the emailed code is confirmed in verifyEmail().
   const passwordHash = await argon2.hash(password, {
     type: argon2.argon2id,
     memoryCost: 19456,
@@ -337,78 +337,23 @@ async function register({ username, email, password, publicKey, encryptedPrivate
     parallelism: 1,
   });
 
-  const code = generateVerificationCode();
-  pendingRegistrations.set(emailNorm, {
-    username,
-    email,
-    passwordHash,
-    publicKey,
-    encryptedPrivateKey,
-    keySalt,
-    code,
-    expiresAt: Date.now() + VERIFY_CODE_TTL_MS,
-    sentAt: Date.now(),
-  });
-
-  await sendVerificationEmail(email, code);
-  return { verificationRequired: true, email };
-}
-
-async function verifyEmail({ email, code, ipAddress, userAgent }) {
-  cleanupExpiredPending();
-  const emailNorm = email.toLowerCase();
-  const pending = pendingRegistrations.get(emailNorm);
-
-  // One generic error for missing/expired/wrong/too-many attempts, so this can't be
-  // used to tell whether an email is registered: a taken email has no pending (see
-  // the enumeration-safe branch in register()), which looks exactly like a wrong
-  // code on a real pending. The attempt cap below also burns the challenge silently
-  // rather than announcing it, to keep that indistinguishable.
-  const badCode = () => {
-    const error = new Error("That code is incorrect or has expired.");
-    error.statusCode = 400;
-    return error;
-  };
-  if (!pending) throw badCode();
-
-  const codeMatches = typeof code === "string"
-    && code.length === pending.code.length
-    && crypto.timingSafeEqual(Buffer.from(code), Buffer.from(pending.code));
-
-  if (!codeMatches) {
-    pending.attempts = (pending.attempts || 0) + 1;
-    if (pending.attempts >= MAX_CODE_ATTEMPTS) pendingRegistrations.delete(emailNorm);
-    throw badCode();
-  }
-
-  // Final collision check in case someone claimed the name while this was pending.
-  if (await userRepository.findByEmail(pending.email)
-    || await userRepository.findByUsername(pending.username)
-    || userRepository.isUsernameReserved(pending.username)) {
-    pendingRegistrations.delete(emailNorm);
-    const error = new Error("That username or email was just taken. Please register again.");
-    error.statusCode = 409;
-    throw error;
-  }
-
-  // Code confirmed - only NOW does the account get created in the database. The
-  // UNIQUE index on username_normalized (and email_normalized) is the hard
-  // guarantee: if another pending signup won the race to this exact name in the
-  // sliver of time since the check above, the insert throws and we report it
-  // cleanly. Two accounts can never share a username - first come, first served.
+  // Self-hosted servers don't send email: the account is created and signed in
+  // IMMEDIATELY - no verification code. (Once the federation join flow ships,
+  // most members won't register here at all; local accounts are mainly the
+  // owner and invited friends.) The UNIQUE indexes are still the hard guarantee
+  // against a name/email race.
   let user;
   try {
     user = await userRepository.createUser({
-      username: pending.username,
-      email: pending.email,
-      passwordHash: pending.passwordHash,
-      publicKey: pending.publicKey,
-      encryptedPrivateKey: pending.encryptedPrivateKey,
-      keySalt: pending.keySalt,
+      username,
+      email,
+      passwordHash,
+      publicKey,
+      encryptedPrivateKey,
+      keySalt,
     });
   } catch (err) {
     if (isUniqueViolation(err)) {
-      pendingRegistrations.delete(emailNorm);
       const error = new Error("That username or email was just taken. Please register again.");
       error.statusCode = 409;
       throw error;
@@ -416,31 +361,25 @@ async function verifyEmail({ email, code, ipAddress, userAgent }) {
     throw err;
   }
   userRepository.markEmailVerified(user.user_id);
-  pendingRegistrations.delete(emailNorm);
-
   await userRepository.writeAuditLog({ userId: user.user_id, email: user.email, success: true, ipAddress, userAgent });
-
   return createSessionForUser({ user, rememberMe: true, ipAddress, userAgent });
 }
 
-async function resendVerification({ email }) {
-  cleanupExpiredPending();
-  const pending = pendingRegistrations.get(email.toLowerCase());
-  // Resolve quietly when there's nothing pending so this can't probe emails.
-  if (!pending) {
-    return { ok: true };
-  }
-  if (Date.now() - pending.sentAt < VERIFY_RESEND_COOLDOWN_MS) {
-    const error = new Error("Please wait a moment before requesting another code.");
-    error.statusCode = 429;
-    throw error;
-  }
-  pending.code = generateVerificationCode();
-  pending.expiresAt = Date.now() + VERIFY_CODE_TTL_MS;
-  pending.sentAt = Date.now();
-  pending.attempts = 0;
-  await sendVerificationEmail(pending.email, pending.code);
-  return { ok: true };
+// Self-hosted servers create accounts instantly in register() - there is no
+// email, so there is nothing to verify. Kept as endpoints for API shape
+// compatibility with the main app's client.
+function emailNotUsedError() {
+  const error = new Error("This server doesn't use email verification - accounts are active as soon as they register.");
+  error.statusCode = 400;
+  return error;
+}
+
+async function verifyEmail() {
+  throw emailNotUsedError();
+}
+
+async function resendVerification() {
+  throw emailNotUsedError();
 }
 
 async function login({ email: identifier, password, rememberMe, ipAddress, userAgent }) {
@@ -526,23 +465,9 @@ async function login({ email: identifier, password, rememberMe, ipAddress, userA
     throw authError();
   }
 
-  // Password is correct. If 2FA-on-login is enabled, don't issue a session yet -
-  // email a code and require verifyLogin() to finish, mirroring registration.
-  if (user.two_factor_enabled) {
-    cleanupExpiredPendingLogins();
-    const code = generateVerificationCode();
-    const challengeId = crypto.randomUUID();
-    pendingLogins.set(challengeId, {
-      userId: user.user_id,
-      email: user.email,
-      code,
-      rememberMe: Boolean(rememberMe),
-      expiresAt: Date.now() + VERIFY_CODE_TTL_MS,
-      sentAt: Date.now(),
-    });
-    await sendVerificationEmail(user.email, code);
-    return { twoFactorRequired: true, challengeId, email: maskEmail(user.email) };
-  }
+  // Password is correct. Email 2FA is not available on a self-hosted server
+  // (there is no email channel to deliver the code), so a correct password
+  // always signs in directly - even if two_factor_enabled was somehow set.
 
   await userRepository.recordSuccessfulLogin(user.user_id);
 
@@ -557,68 +482,20 @@ async function login({ email: identifier, password, rememberMe, ipAddress, userA
   return session;
 }
 
-// Finish a 2FA login: verify the emailed code, then issue the session.
-async function verifyLogin({ challengeId, code, ipAddress, userAgent }) {
-  cleanupExpiredPendingLogins();
-  const pending = pendingLogins.get(challengeId);
-  if (!pending) {
-    const error = new Error("Your sign-in session expired. Please sign in again.");
-    error.statusCode = 410;
-    throw error;
-  }
-
-  const codeMatches = typeof code === "string"
-    && code.length === pending.code.length
-    && crypto.timingSafeEqual(Buffer.from(code), Buffer.from(pending.code));
-  if (!codeMatches) {
-    pending.attempts = (pending.attempts || 0) + 1;
-    if (pending.attempts >= MAX_CODE_ATTEMPTS) {
-      pendingLogins.delete(challengeId);
-      const error = new Error("Too many incorrect codes. Please sign in again.");
-      error.statusCode = 429;
-      throw error;
-    }
-    const error = new Error("That code is incorrect.");
-    error.statusCode = 400;
-    throw error;
-  }
-
-  pendingLogins.delete(challengeId);
-
-  const user = await userRepository.findById(pending.userId);
-  if (!user) {
-    const error = new Error("Account not found.");
-    error.statusCode = 401;
-    throw error;
-  }
-
-  await userRepository.recordSuccessfulLogin(user.user_id);
-  const session = await createSessionForUser({
-    user: { ...user, last_login_at: new Date().toISOString() },
-    rememberMe: pending.rememberMe,
-    ipAddress,
-    userAgent,
-  });
-  await userRepository.writeAuditLog({ userId: user.user_id, email: user.email, success: true, ipAddress, userAgent });
-  return session;
+// Email 2FA doesn't exist on a self-hosted server - login() never withholds a
+// session, so there is never a challenge to finish.
+function twoFactorNotAvailableError() {
+  const error = new Error("Email 2FA isn't available on a self-hosted server - sign in with your password.");
+  error.statusCode = 400;
+  return error;
 }
 
-async function resendLoginCode({ challengeId }) {
-  cleanupExpiredPendingLogins();
-  const pending = pendingLogins.get(challengeId);
-  // Resolve quietly when nothing's pending so this can't be used to probe.
-  if (!pending) return { ok: true };
-  if (Date.now() - pending.sentAt < VERIFY_RESEND_COOLDOWN_MS) {
-    const error = new Error("Please wait a moment before requesting another code.");
-    error.statusCode = 429;
-    throw error;
-  }
-  pending.code = generateVerificationCode();
-  pending.expiresAt = Date.now() + VERIFY_CODE_TTL_MS;
-  pending.sentAt = Date.now();
-  pending.attempts = 0;
-  await sendVerificationEmail(pending.email, pending.code);
-  return { ok: true };
+async function verifyLogin() {
+  throw twoFactorNotAvailableError();
+}
+
+async function resendLoginCode() {
+  throw twoFactorNotAvailableError();
 }
 
 // Auto-delete durations the client may pick (seconds): 1h, 8h, 24h, 7d, 1 month.
@@ -644,7 +521,14 @@ function getSecuritySettings(account) {
 }
 
 function updateSecuritySettings({ userId, twoFactorEnabled, autodeleteSeconds, autodeleteDms, autodeleteDmsBoth, autodeleteServers, inactiveDeleteMonths, dmPrivacy, friendRequestPrivacy }) {
-  const patch = { userId, twoFactorEnabled, serverAutodelete: autodeleteServers, autodeleteDms, autodeleteDmsBoth };
+  // Email 2FA can't work without email - refuse to enable it rather than
+  // letting someone flip a switch that would lock them out at next login.
+  if (twoFactorEnabled) {
+    const error = new Error("Email 2FA isn't available on a self-hosted server - it has no email.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const patch = { userId, twoFactorEnabled: false, serverAutodelete: autodeleteServers, autodeleteDms, autodeleteDmsBoth };
   // Only accept a whitelisted inactivity window (0 = never).
   if (typeof inactiveDeleteMonths === "number" && INACTIVE_DELETE_MONTHS.has(inactiveDeleteMonths)) {
     patch.inactiveDeleteMonths = inactiveDeleteMonths;
@@ -941,205 +825,39 @@ async function changePassword({ userId, currentPassword, newPassword, encryptedP
   }
 }
 
-// Begin a "forgot password" reset from the login screen. ENUMERATION-SAFE: it
-// always returns the same shape and only actually emails a code when the account
-// exists - the caller can't tell whether the address is registered.
-async function forgotPassword({ email }) {
-  cleanupExpiredPasswordResets();
-  const challengeId = crypto.randomUUID();
-  const trimmed = typeof email === "string" ? email.trim() : "";
-
-  const user = isValidEmail(trimmed) ? await userRepository.findByEmail(trimmed) : null;
-  if (user) {
-    const code = generateVerificationCode();
-    pendingPasswordResets.set(challengeId, {
-      userId: user.user_id,
-      email: user.email,
-      code,
-      expiresAt: Date.now() + VERIFY_CODE_TTL_MS,
-      sentAt: Date.now(),
-    });
-    // Fire-and-forget so the response time doesn't betray whether we sent mail.
-    sendVerificationEmail(user.email, code).catch(() => {});
-  }
-
-  // The challengeId is real either way; if no account matched it simply maps to
-  // nothing, so any code entered later fails like a wrong code would.
-  return { ok: true, challengeId };
+// A self-hosted server has no email channel, so every emailed-code flow below
+// is disabled with an honest message. Password changes still work while signed
+// in (change-password re-verifies the current password) - what does NOT exist
+// is recovery for a FORGOTTEN password: hosts should keep their password in a
+// password manager.
+function noEmailFlowError(what) {
+  const error = new Error(`${what} isn't available on a self-hosted server - it has no email. If you forgot your password, ask the server owner (or re-register).`);
+  error.statusCode = 400;
+  return error;
 }
 
-// Finish a reset: verify the emailed code, then set the new password. Because the
-// OLD password is unknown here, the password-derived E2E private key can't be
-// recovered - so server-side key material is cleared and the client regenerates
-// fresh keys on next login. The user's now-undecryptable DM history is purged
-// too (the conversations stay listed, just emptied), and every session is signed
-// out. Returns the DM partners so the caller can refresh their live views.
-async function resetPassword({ challengeId, code, newPassword }) {
-  cleanupExpiredPasswordResets();
-  const pending = pendingPasswordResets.get(challengeId);
-
-  // One generic error for missing/expired/wrong so a reset can't probe emails.
-  const badCode = () => {
-    const error = new Error("That code is incorrect or has expired.");
-    error.statusCode = 400;
-    return error;
-  };
-  if (!pending) throw badCode();
-
-  const codeMatches = typeof code === "string"
-    && code.length === pending.code.length
-    && crypto.timingSafeEqual(Buffer.from(code), Buffer.from(pending.code));
-  if (!codeMatches) {
-    pending.attempts = (pending.attempts || 0) + 1;
-    if (pending.attempts >= MAX_CODE_ATTEMPTS) pendingPasswordResets.delete(challengeId);
-    throw badCode();
-  }
-
-  if (typeof newPassword !== "string" || newPassword.length < MIN_PASSWORD_LENGTH) {
-    const error = new Error("New password needs to be at least 8 characters.");
-    error.statusCode = 400;
-    throw error;
-  }
-
-  const { userId } = pending;
-  const passwordHash = await argon2.hash(newPassword, ARGON2_OPTIONS);
-  userRepository.updatePasswordResetKeys({ userId, passwordHash });
-
-  // Capture who they were talking to BEFORE wiping, so their lists can refresh.
-  const affectedPartnerIds = messageRepository.getConversationPartnerIds(userId);
-  await messageRepository.deleteAllDmMessagesForUser(userId);
-  // Group DMs are E2E too, so the user's own group messages were sealed under the
-  // now-wiped key. Purge just THEIR authored group messages (others' stay) so they
-  // aren't left as undecryptable junk - same idea as the DM wipe above.
-  await groupService.clearUserGroupMessages(userId);
-
-  sessionRepository.revokeAllSessions(userId);
-  pendingPasswordResets.delete(challengeId);
-  return { ok: true, userId, affectedPartnerIds };
+async function forgotPassword() {
+  throw noEmailFlowError("Password reset by email");
 }
 
-async function resendPasswordResetCode({ challengeId }) {
-  cleanupExpiredPasswordResets();
-  const pending = pendingPasswordResets.get(challengeId);
-  // Resolve quietly when nothing's pending so this can't be used to probe.
-  if (!pending) return { ok: true };
-  if (Date.now() - pending.sentAt < VERIFY_RESEND_COOLDOWN_MS) {
-    const error = new Error("Please wait a moment before requesting another code.");
-    error.statusCode = 429;
-    throw error;
-  }
-  pending.code = generateVerificationCode();
-  pending.expiresAt = Date.now() + VERIFY_CODE_TTL_MS;
-  pending.sentAt = Date.now();
-  pending.attempts = 0;
-  await sendVerificationEmail(pending.email, pending.code);
-  return { ok: true };
+async function resetPassword() {
+  throw noEmailFlowError("Password reset by email");
 }
 
-// Step 1 of changing email: validate the target, then email a 6-digit code to
-// the user's CURRENT address. Nothing changes in the DB yet.
-async function startEmailChange({ account, newEmail }) {
-  cleanupExpiredEmailChanges();
-
-  const trimmed = typeof newEmail === "string" ? newEmail.trim() : "";
-  if (!isValidEmail(trimmed)) {
-    const error = new Error("Enter a valid email address.");
-    error.statusCode = 400;
-    throw error;
-  }
-  const newEmailNorm = trimmed.toLowerCase();
-
-  if (newEmailNorm === String(account.email).toLowerCase()) {
-    const error = new Error("That's already your email.");
-    error.statusCode = 400;
-    throw error;
-  }
-
-  if (userRepository.isEmailBanned(trimmed)) {
-    const error = new Error("This email address is not permitted.");
-    error.statusCode = 403;
-    throw error;
-  }
-
-  if (await userRepository.findByEmail(trimmed) || emailChangePendingElsewhere(newEmailNorm)) {
-    const error = new Error("That email is already in use.");
-    error.statusCode = 409;
-    throw error;
-  }
-
-  const code = generateVerificationCode();
-  const challengeId = crypto.randomUUID();
-  pendingEmailChanges.set(challengeId, {
-    userId: account.user_id,
-    currentEmail: account.email,
-    newEmail: trimmed,
-    newEmailNorm,
-    code,
-    expiresAt: Date.now() + VERIFY_CODE_TTL_MS,
-    sentAt: Date.now(),
-  });
-
-  // The code goes to the CURRENT inbox - confirming the account owner is the one
-  // making the change, not merely someone who can receive at the new address.
-  await sendVerificationEmail(account.email, code);
-  return { challengeId, email: maskEmail(account.email) };
+async function resendPasswordResetCode() {
+  throw noEmailFlowError("Password reset by email");
 }
 
-// Step 2: confirm the emailed code, then actually move the account to newEmail.
-async function verifyEmailChange({ userId, challengeId, code }) {
-  cleanupExpiredEmailChanges();
-  const pending = pendingEmailChanges.get(challengeId);
-  if (!pending || pending.userId !== userId) {
-    const error = new Error("Your email-change session expired. Please start again.");
-    error.statusCode = 410;
-    throw error;
-  }
-
-  const codeMatches = typeof code === "string"
-    && code.length === pending.code.length
-    && crypto.timingSafeEqual(Buffer.from(code), Buffer.from(pending.code));
-  if (!codeMatches) {
-    pending.attempts = (pending.attempts || 0) + 1;
-    if (pending.attempts >= MAX_CODE_ATTEMPTS) {
-      pendingEmailChanges.delete(challengeId);
-      const error = new Error("Too many incorrect codes. Please start the email change again.");
-      error.statusCode = 429;
-      throw error;
-    }
-    const error = new Error("That code is incorrect.");
-    error.statusCode = 400;
-    throw error;
-  }
-
-  // Guard the race where someone else registered the target while this was open.
-  if (await userRepository.findByEmail(pending.newEmail)) {
-    pendingEmailChanges.delete(challengeId);
-    const error = new Error("That email was just taken. Please try a different one.");
-    error.statusCode = 409;
-    throw error;
-  }
-
-  userRepository.updateEmail({ userId, email: pending.newEmail });
-  pendingEmailChanges.delete(challengeId);
-  return { email: pending.newEmail };
+async function startEmailChange() {
+  throw noEmailFlowError("Changing your email");
 }
 
-async function resendEmailChangeCode({ userId, challengeId }) {
-  cleanupExpiredEmailChanges();
-  const pending = pendingEmailChanges.get(challengeId);
-  // Resolve quietly when nothing's pending so this can't be used to probe.
-  if (!pending || pending.userId !== userId) return { ok: true };
-  if (Date.now() - pending.sentAt < VERIFY_RESEND_COOLDOWN_MS) {
-    const error = new Error("Please wait a moment before requesting another code.");
-    error.statusCode = 429;
-    throw error;
-  }
-  pending.code = generateVerificationCode();
-  pending.expiresAt = Date.now() + VERIFY_CODE_TTL_MS;
-  pending.sentAt = Date.now();
-  pending.attempts = 0;
-  await sendVerificationEmail(pending.currentEmail, pending.code);
-  return { ok: true };
+async function verifyEmailChange() {
+  throw noEmailFlowError("Changing your email");
+}
+
+async function resendEmailChangeCode() {
+  throw noEmailFlowError("Changing your email");
 }
 
 async function recordHeartbeat(userId, ip, status = null) {

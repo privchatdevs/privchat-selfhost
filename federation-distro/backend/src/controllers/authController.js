@@ -486,14 +486,16 @@ async function resendEmailChangeCode(req, res, next) {
 async function register(req, res, next) {
   try {
     const payload = registerSchema.parse(req.body);
-    const result = await authService.register({
+    const session = await authService.register({
       ...payload,
       ipAddress: getClientIp(req),
       userAgent: req.get("User-Agent") || "",
     });
 
-    // No session yet - the account must confirm its email first.
-    res.status(202).json({ verificationRequired: true, email: result.email });
+    // Self-hosted servers don't send email: the account is live immediately,
+    // so registration signs you straight in - no verification step.
+    res.cookie(config.cookieNames.session, session.token, authService.sessionCookieOptions(session.expiresAt));
+    res.status(201).json({ user: session.user });
   } catch (error) {
     next(error);
   }

@@ -7,7 +7,7 @@ function createCsrfToken(req, res) {
   res.cookie(config.cookieNames.csrf, token, {
     httpOnly: true,
     sameSite: "strict",
-    secure: config.isProduction,
+    secure: config.cookieSecure,
     signed: true,
     path: "/",
   });

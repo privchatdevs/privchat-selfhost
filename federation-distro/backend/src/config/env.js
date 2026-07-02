@@ -68,14 +68,8 @@ const config = {
   dbPath: process.env.DB_PATH || path.join(dataDir, "auth.db"),
   messagesDbPath: process.env.MESSAGES_DB_PATH || path.join(dataDir, "data.db"),
   adminDbPath: process.env.ADMIN_DB_PATH || path.join(dataDir, "admin.db"),
-  smtp: {
-    host: process.env.SMTP_HOST || "",
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: process.env.SMTP_SECURE === "true",
-    user: process.env.SMTP_USER || "",
-    pass: process.env.SMTP_PASS || "",
-    from: process.env.MAIL_FROM || `PrivChat <no-reply@${publicHost}>`,
-  },
+  // No SMTP config: a self-hosted community server never sends email.
+  // Registration is instant and the email-code flows are disabled in authService.
   // S3-compatible object storage (Backblaze B2, MinIO, AWS S3, ...) - stores all
   // user media (avatars, banners, server icons, attachments). OPTIONAL: leave
   // blank and media uploads are simply disabled; chat still works. The B2_*
@@ -105,9 +99,15 @@ config.federation = {
   keyPath: process.env.FEDERATION_KEY_PATH || path.join(dataDir, "federation-key.json"),
 };
 
+// Cookie hardening follows the PUBLIC_URL scheme, NOT NODE_ENV: __Host- names
+// and the Secure attribute require HTTPS, and browsers silently DROP such
+// cookies over plain http - which would break login on an http self-host even
+// though the API answers fine. HTTPS servers get the full hardening; http
+// (LAN/raw-IP testing) gets working non-secure cookies.
+config.cookieSecure = publicUrl.startsWith("https://");
 config.cookieNames = {
-  csrf: config.isProduction ? "__Host-csrf" : "csrf",
-  session: config.isProduction ? "__Host-session" : "session",
+  csrf: config.cookieSecure ? "__Host-csrf" : "csrf",
+  session: config.cookieSecure ? "__Host-session" : "session",
 };
 
 module.exports = { config };
