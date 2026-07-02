@@ -1,0 +1,20 @@
+# Secrets - never commit
+.env
+*.env.local
+
+# Live data (databases, uploads, federation signing key)
+data/
+backend/data/
+*.db
+*.db-journal
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Dependencies and logs
+node_modules/
+*.log
+
+# OS cruft
+.DS_Store
+Thumbs.db
